@@ -1,0 +1,520 @@
+---
+title: "Predictive Analytics Final"
+author: "Drew Duffy"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+```{r}
+library(nflverse)
+library(nflreadr)
+library(ggplot2)
+library(dplyr)
+library(randomForest)
+library(nflplotR)
+library(caret)
+```
+
+
+```{r}
+contracts <- load_contracts()
+  
+contracts <- contracts %>%
+  filter(draft_round <= 7) %>% 
+  filter(draft_year >= 1990)
+
+
+# we can switch the years after draft that we want
+sign_year_after_draft <- 5  # Set the number of years after draft for re-signing
+
+# Filter and transform the contracts data
+resign <- contracts %>%
+  filter(year_signed > draft_year) %>%
+  group_by(player) %>% 
+  slice_min(year_signed) %>% 
+  mutate(
+    years_after_draft = year_signed - draft_year,  # Calculate how many years after the draft the player signed
+    resigned_with_draft_team = ifelse(team == draft_team & years_after_draft <= sign_year_after_draft, 1, 0)  # Check if re-signed with draft team within the specified number of years
+  ) %>%
+  distinct(player, .keep_all = TRUE)  
+
+
+
+clean_resign <- resign %>%
+  select(player, position, team, draft_team, year_signed, gsis_id, 
+         draft_year, draft_round, draft_overall, draft_year, years_after_draft, 
+         resigned_with_draft_team) %>% 
+  # renaming the id column so we can hopefully merge them back after 
+  dplyr::rename(player_id = gsis_id)
+
+# pulling the offensive and defensive stats, we can switch the season range too
+offense_stats <- load_player_stats(seasons = 2000:2024, stat_type = "offense")
+
+offense_stats <- offense_stats %>% mutate(position = ifelse( player_display_name == "Trent Richardson", "RB", position ))
+offense_stats <- offense_stats %>% mutate(position = ifelse( player_display_name == "Mark Walton", "RB", position ))
+offense_stats <- offense_stats %>% mutate(position = ifelse( player_display_name == "James Casey", "TE", position ))
+
+
+total_stat_by_year <- offense_stats %>%
+  group_by(player_id) %>%
+  dplyr::rename(season_stats = season) %>% 
+  summarize(
+    position = first(position),
+    
+    # sum of the passing stats that are in the list
+    completions = sum(completions, na.rm = TRUE),
+    attempts = sum(attempts, na.rm = TRUE),
+    passing_yards = sum(passing_yards, na.rm = TRUE),
+    passing_tds = sum(passing_tds, na.rm = TRUE),
+    interceptions = sum(interceptions, na.rm = TRUE),
+    sacks = sum(sacks, na.rm = TRUE),
+    sack_yards = sum(sack_yards, na.rm = TRUE),
+    sack_fumbles = sum(sack_fumbles, na.rm = TRUE),
+    sack_fumbles_lost = sum(sack_fumbles_lost, na.rm = TRUE),
+    passing_air_yards = sum(passing_air_yards, na.rm = TRUE),
+    passing_yards_after_catch = sum(passing_yards_after_catch, na.rm = TRUE),
+    passing_first_downs = sum(passing_first_downs, na.rm = TRUE),
+    passing_epa = sum(passing_epa, na.rm = TRUE),
+    passing_2pt_conversions = sum(passing_2pt_conversions, na.rm = TRUE),
+    
+    # sum of the rushing stats that are in the list
+    carries = sum(carries, na.rm = TRUE),
+    rushing_yards = sum(rushing_yards, na.rm = TRUE),
+    rushing_tds = sum(rushing_tds, na.rm = TRUE),
+    rushing_fumbles = sum(rushing_fumbles, na.rm = TRUE),
+    rushing_fumbles_lost = sum(rushing_fumbles_lost, na.rm = TRUE),
+    rushing_first_downs = sum(rushing_first_downs, na.rm = TRUE),
+    rushing_epa = sum(rushing_epa, na.rm = TRUE),
+    rushing_2pt_conversions = sum(rushing_2pt_conversions, na.rm = TRUE),
+    
+    # sum of the recieving stats that are in the list
+    receptions = sum(receptions, na.rm = TRUE),
+    targets = sum(targets, na.rm = TRUE),
+    receiving_yards = sum(receiving_yards, na.rm = TRUE),
+    receiving_tds = sum(receiving_tds, na.rm = TRUE),
+    receiving_fumbles = sum(receiving_fumbles, na.rm = TRUE),
+    receiving_fumbles_lost = sum(receiving_fumbles_lost, na.rm = TRUE),
+    receiving_air_yards = sum(receiving_air_yards, na.rm = TRUE),
+    receiving_yards_after_catch = sum(receiving_yards_after_catch, na.rm = TRUE),
+    receiving_first_downs = sum(receiving_first_downs, na.rm = TRUE),
+    receiving_epa = sum(receiving_epa, na.rm = TRUE),
+    receiving_2pt_conversions = sum(receiving_2pt_conversions, na.rm = TRUE),
+  )
+
+
+sum_stats <- total_stat_by_year %>% 
+  group_by(position, player_id) %>% 
+  filter(position %in% c("QB", "RB", "TE", "WR"))
+
+
+
+contract_and_stats <- clean_resign %>%
+  full_join(sum_stats, by = "player_id") 
+
+
+contract_and_stats <- contract_and_stats %>% 
+  filter(draft_year >= 1990, na.rm = TRUE, 
+         draft_year <= 2020, na.rm = TRUE) %>% 
+  filter(position.x %in% c("QB", "RB", "TE", "WR")) %>% 
+  filter(!is.na(player_id)) %>% 
+  select(-position.y)
+
+contract_and_stats <- contract_and_stats[complete.cases(contract_and_stats$completions),]
+
+#changing NA draft teams
+contract_and_stats$draft_team[is.na(contract_and_stats$draft_team)] <- "49ers"
+
+contract_and_stats <- contract_and_stats %>% mutate(resigned_with_draft_team = ifelse(team == draft_team & years_after_draft <= sign_year_after_draft, 1, 0))
+
+```
+
+
+
+
+##Change data types to fit RF model we can’t use player, player id, (draft year and year resigned maybe could work as factors)
+```{r}
+contract_and_stats$position.x = as.factor(contract_and_stats$position.x)
+contract_and_stats$team = as.factor(contract_and_stats$team)
+contract_and_stats$draft_team = as.factor(contract_and_stats$draft_team)
+contract_and_stats$draft_round = as.factor(contract_and_stats$draft_round)
+contract_and_stats$draft_overall = as.numeric(contract_and_stats$draft_overall)
+contract_and_stats$years_after_draft = as.numeric(contract_and_stats$years_after_draft)
+contract_and_stats$resigned_with_draft_team = as.factor(contract_and_stats$resigned_with_draft_team)
+contract_and_stats$completions = as.numeric(contract_and_stats$completions)
+contract_and_stats$attempts = as.numeric(contract_and_stats$attempts)
+contract_and_stats$passing_yards = as.numeric(contract_and_stats$passing_yards)
+contract_and_stats$passing_tds = as.numeric(contract_and_stats$passing_tds)
+contract_and_stats$interceptions = as.numeric(contract_and_stats$interceptions)
+contract_and_stats$sacks = as.numeric(contract_and_stats$sacks)
+contract_and_stats$sack_yards = as.numeric(contract_and_stats$sack_yards)
+contract_and_stats$sack_fumbles = as.numeric(contract_and_stats$sack_fumbles)
+contract_and_stats$sack_fumbles_lost = as.numeric(contract_and_stats$sack_fumbles_lost)
+contract_and_stats$rushing_first_downs = as.numeric(contract_and_stats$rushing_first_downs)
+contract_and_stats$passing_air_yards = as.numeric(contract_and_stats$passing_air_yards)
+contract_and_stats$passing_yards_after_catch = as.numeric(contract_and_stats$passing_yards_after_catch)
+contract_and_stats$passing_first_downs = as.numeric(contract_and_stats$passing_first_downs)
+contract_and_stats$passing_epa = as.numeric(contract_and_stats$passing_epa)
+contract_and_stats$passing_2pt_conversions = as.numeric(contract_and_stats$passing_2pt_conversions)
+contract_and_stats$carries = as.numeric(contract_and_stats$carries)
+contract_and_stats$rushing_yards = as.numeric(contract_and_stats$rushing_yards)
+contract_and_stats$rushing_tds = as.numeric(contract_and_stats$rushing_tds)
+contract_and_stats$rushing_fumbles = as.numeric(contract_and_stats$rushing_fumbles)
+contract_and_stats$rushing_fumbles_lost = as.numeric(contract_and_stats$rushing_fumbles_lost)
+contract_and_stats$rushing_epa = as.numeric(contract_and_stats$rushing_epa)
+contract_and_stats$rushing_2pt_conversions = as.numeric(contract_and_stats$rushing_epa)
+contract_and_stats$receptions = as.numeric(contract_and_stats$receptions)
+contract_and_stats$targets = as.numeric(contract_and_stats$targets)
+contract_and_stats$receiving_yards = as.numeric(contract_and_stats$receiving_yards)
+contract_and_stats$receiving_tds = as.numeric(contract_and_stats$receiving_tds)
+contract_and_stats$receiving_fumbles = as.numeric(contract_and_stats$receiving_fumbles)
+contract_and_stats$receiving_fumbles_lost = as.numeric(contract_and_stats$receiving_fumbles_lost)
+contract_and_stats$receiving_air_yards = as.numeric(contract_and_stats$receiving_air_yards)
+contract_and_stats$receiving_yards_after_catch = as.numeric(contract_and_stats$receiving_yards_after_catch)
+contract_and_stats$receiving_first_downs = as.numeric(contract_and_stats$receiving_first_downs)
+contract_and_stats$receiving_epa = as.numeric(contract_and_stats$receiving_epa)
+contract_and_stats$receiving_2pt_conversions = as.numeric(contract_and_stats$receiving_2pt_conversions)
+
+contract_and_stats = contract_and_stats%>%
+  select(-player, -player_id)
+
+```
+
+
+
+##Data Partitioning and Random Forest Model (We need to format vars first to either be factors or numericals) (we can also tune this later)
+```{r}
+
+team_model <- glm(resigned_with_draft_team ~ draft_team, 
+                 data = contract_and_stats,
+                 family = binomial)
+
+position_model  <- glm(resigned_with_draft_team ~ position.x, 
+                       data = contract_and_stats, 
+                       family = binomial)
+
+draft_round_model <- glm(resigned_with_draft_team ~ draft_round, 
+                         data = contract_and_stats, 
+                         family = binomial)
+
+summary(team_model)
+summary(position_model)
+summary(draft_round_model)
+
+contract_and_stats_qb <- contract_and_stats %>% 
+  filter(position.x == "QB") %>% 
+  select(draft_team, draft_year, draft_round, draft_overall, resigned_with_draft_team, completions, attempts, passing_yards, passing_tds, interceptions, sacks, sack_yards, sack_fumbles, sack_fumbles_lost, passing_air_yards, passing_yards_after_catch, passing_first_downs, passing_epa, passing_2pt_conversions, carries, rushing_yards, rushing_tds, rushing_fumbles, rushing_fumbles_lost, rushing_first_downs, rushing_epa, rushing_2pt_conversions
+)
+
+
+contract_and_stats_qb_scaled <- contract_and_stats_qb
+numeric_cols <- sapply(contract_and_stats_qb, is.numeric)
+contract_and_stats_qb_scaled[numeric_cols] <- scale(contract_and_stats_qb[numeric_cols])
+
+
+qb_model <- glm(resigned_with_draft_team ~ . -player -draft_team -rushing_2pt_conversions,
+                 data = contract_and_stats_qb_scaled, 
+                 family = binomial)
+
+summary(qb_model)
+
+
+contract_and_stats_rb <- contract_and_stats %>% 
+  filter(position.x == "RB") %>% 
+  select(draft_year, draft_round, draft_overall, resigned_with_draft_team, carries, rushing_yards, rushing_tds, rushing_fumbles, rushing_fumbles_lost, rushing_first_downs, rushing_epa, rushing_2pt_conversions, receptions, targets, receiving_yards, receiving_tds, receiving_fumbles, receiving_fumbles_lost, receiving_air_yards, receiving_yards_after_catch, receiving_first_downs, receiving_epa, receiving_2pt_conversions
+)
+
+
+contract_and_stats_rb_scaled <- contract_and_stats_rb
+numeric_cols_rb <- sapply(contract_and_stats_rb, is.numeric)
+contract_and_stats_rb_scaled[numeric_cols_rb] <- scale(contract_and_stats_rb[numeric_cols_rb])
+
+
+rb_model <- glm(resigned_with_draft_team ~ . -player,
+                 data = contract_and_stats_rb_scaled, 
+                 family = binomial)
+
+summary(rb_model)
+
+contract_and_stats_wr <- contract_and_stats %>% 
+  filter(position.x == "WR") %>% 
+  select(draft_year, draft_round, draft_overall, resigned_with_draft_team, carries, rushing_yards, rushing_tds, rushing_fumbles, rushing_fumbles_lost, rushing_first_downs, rushing_epa, rushing_2pt_conversions, receptions, targets, receiving_yards, receiving_tds, receiving_fumbles, receiving_fumbles_lost, receiving_air_yards, receiving_yards_after_catch, receiving_first_downs, receiving_epa, receiving_2pt_conversions
+)
+
+
+contract_and_stats_wr_scaled <- contract_and_stats_wr
+numeric_cols_wr <- sapply(contract_and_stats_wr, is.numeric)
+contract_and_stats_rb_scaled[numeric_cols_wr] <- scale(contract_and_stats_rb[numeric_cols_wr])
+
+
+wr_model <- glm(resigned_with_draft_team ~ . -player -rushing_2pt_conversions,
+                 data = contract_and_stats_wr_scaled, 
+                 family = binomial)
+
+summary(wr_model)
+
+
+
+
+
+contract_and_stats_ungrouped = contract_and_stats %>%
+  ungroup() %>%    
+  dplyr::select(-player, -team)  
+
+summary(contract_and_stats_ungrouped)
+
+str(contract_and_stats_ungrouped)
+
+sum(is.na(contract_and_stats$resigned_with_draft_team) | contract_and_stats$resigned_with_draft_team == "")
+
+train_indices = createDataPartition(contract_and_stats_ungrouped$resigned_with_draft_team, p = 0.60, list = FALSE)
+
+train_data = contract_and_stats_ungrouped[train_indices, ]
+
+valid_data = contract_and_stats_ungrouped[-train_indices, ]
+
+train_data
+#Check to see if training data has NA values
+sum(is.na(train_data))
+
+colSums(is.na(train_data))
+
+head(valid_data,20)
+
+
+train_data_clean = na.omit(train_data)
+
+rf_draft_mod = randomForest(resigned_with_draft_team ~.,
+                     	data = train_data_clean,
+                     	ntree = 200,
+                     	nodesize = 1,
+                     	mtry = 40)
+
+rf_pred = predict(rf_draft_mod, valid_data, type = "prob")
+
+
+rf_pred_class = rep("0", nrow(rf_pred))
+
+rf_pred_class[rf_pred[,2] >= 0.5] = "1"
+
+resign_table = table(rf_pred_class, valid_data$resigned_with_draft_team)
+
+levels(as.factor(rf_pred_class))
+levels(as.factor(valid_data$resigned_with_draft_team))
+
+confusionMatrix(resign_table, positive = "1")
+
+```
+
+```{r , echo= FALSE}
+
+importance <- importance(rf_draft_mod)
+varImpPlot(rf_draft_mod, n.var = 10, main = "Top 10 Feature Importances")
+
+
+contract_and_stats_plots <- contract_and_stats %>%
+  mutate(resigned_with_draft_team = ifelse(resigned_with_draft_team == 1, "yes", "no"))
+
+
+ggplot(contract_and_stats_plots, aes(x = resigned_with_draft_team, fill = resigned_with_draft_team)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Positional Breakdown of Draft Picks Resigning",
+       x = "Re-signed with Draft Team",
+       y = "Count") +
+  scale_fill_manual(values = c("yes" = "navyblue", "no" = "red"), 
+                    name = "Re-signed with Draft Team") +
+  theme_bw() +
+  facet_wrap( ~ position.x) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+contract_and_stats_plots_year <- contract_and_stats_plots %>% 
+  filter(draft_year >= 2010)
+ggplot(contract_and_stats_plots_year, aes(x = resigned_with_draft_team, fill = resigned_with_draft_team)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Year by Year Breakdown of Draft Picks Resigning",
+       x = "Re-signed with Draft Team",
+       y = "Count") +
+  scale_fill_manual(values = c("yes" = "navyblue", "no" = "red"), 
+                    name = "Re-signed with Draft Team") +
+  theme_bw() +
+  facet_wrap( ~ draft_year) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(contract_and_stats_plots, aes(x = resigned_with_draft_team, fill = resigned_with_draft_team)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Draft Round Breakdown of Draft Picks Resigning",
+       x = "Re-signed with Draft Team",
+       y = "Count") +
+  scale_fill_manual(values = c("yes" = "navyblue", "no" = "red"), 
+                    name = "Re-signed with Draft Team") +
+  theme_bw() +
+  facet_wrap( ~ draft_round) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+team_mapping <- c(
+  "49ers" = "SF", 
+  "Bears" = "CHI", 
+  "Bengals" = "CIN", 
+  "Bills" = "BUF", 
+  "Broncos" = "DEN",
+  "Cardinals" = "ARI",
+  "Falcons" = "ATL",
+  "Ravens" = "BAL",
+  "Panthers" = "CAR",
+  "Browns" = "CLE",
+  "Cowboys" = "DAL",
+  "Lions" = "DET",
+  "Packers" = "GB",
+  "Texans" = "HOU",
+  "Colts" = "IND",
+  "Jaguars" = "JAX",
+  "Chiefs" = "KC",
+  "Chargers" = "LAC",
+  "Rams" = "LA",  
+  "Raiders" = "LV",
+  "Dolphins" = "MIA",
+  "Vikings" = "MIN",
+  "Patriots" = "NE",
+  "Saints" = "NO",
+  "Giants" = "NYG",
+  "Jets" = "NYJ",
+  "Eagles" = "PHI",
+  "Steelers" = "PIT",
+  "Seahawks" = "SEA",
+  "Buccaneers" = "TB",
+  "Titans" = "TEN",
+  "Commanders" = "WAS" 
+)
+
+contract_and_stats_plots <- contract_and_stats_plots %>%
+  mutate(draft_team = recode(draft_team, !!!team_mapping))
+contract_and_stats_summary <- contract_and_stats_plots %>%
+  group_by(draft_team, resigned_with_draft_team) %>%
+  summarise(count = n(), .groups = 'drop')
+
+filtered_data <- contract_and_stats_summary %>%
+  filter(draft_team %in% c("KC", "PIT", "NE", "GB", "SEA"))  # Use appropriate abbreviations
+
+# Create the bar plot
+ggplot(filtered_data, aes(x = draft_team, y = count, fill = resigned_with_draft_team)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  nflplotR::geom_nfl_logos(aes(team_abbr = draft_team), width = 0.1, alpha = 0.7, y = 0) + 
+  labs(title = "Re-signed with Draft Team by Team",
+       subtitle = "Teams with Highest Win % in Last 10 Years",
+       x = "Draft Team",
+       y = "Count") +
+  scale_fill_manual(values = c("yes" = "navyblue", "no" = "red"),
+                    name = "Re-signed with Draft Team") +
+  theme_bw() +
+   theme(axis.text.x = element_blank(),  # Remove x-axis labels
+        axis.ticks.x = element_blank()) 
+
+
+filtered_data_2 <- contract_and_stats_summary %>%
+  filter(draft_team %in% c("ARI", "LV", "CLE", "JAX", "WAS"))
+
+ggplot(filtered_data_2, aes(x = draft_team, y = count, fill = resigned_with_draft_team)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  nflplotR::geom_nfl_logos(aes(team_abbr = draft_team), width = 0.1, alpha = 0.7, y = 0) + 
+  labs(title = "Re-signed with Draft Team by Team",
+       subtitle = "Teams with Lowest Win % in Last 10 Years",
+       x = "Draft Team",
+       y = "Count") +
+  scale_fill_manual(values = c("yes" = "navyblue", "no" = "red"),
+                    name = "Re-signed with Draft Team") +
+  theme_bw() +
+   theme(axis.text.x = element_blank(),  # Remove x-axis labels
+        axis.ticks.x = element_blank()) 
+
+
+winwinwin <- read.csv("C://Users/Drew Duffy/OneDrive/win_pct.csv")
+
+
+# Create the named vector for team abbreviations
+team_abbrs <- c(
+  "New England" = "NE", "Kansas City" = "KC", "Green Bay" = "GB", "Pittsburgh" = "PIT", "Baltimore" = "BAL",
+  "Seattle" = "SEA", "New Orleans" = "NO", "Dallas" = "DAL", "Philadelphia" = "PHI", "San Francisco" = "SF",
+  "Buffalo" = "BUF", "Minnesota" = "MIN", "Denver" = "DEN", "Indianapolis" = "IND", "Atlanta" = "ATL",
+  "Cincinnati" = "CIN", "LA Rams" = "LAR", "LA Chargers" = "LAC", "Miami" = "MIA", "Houston" = "HOU",
+  "Tennessee" = "TEN", "Tampa Bay" = "TB", "Detroit" = "DET", "Arizona" = "ARI", "Chicago" = "CHI",
+  "NY Giants" = "NYG", "Carolina" = "CAR", "Las Vegas" = "LV", "NY Jets" = "NYJ", "Washington" = "WSH",
+  "Cleveland" = "CLE", "Jacksonville" = "JAX"
+)
+
+# Add the abbreviation by matching the team names
+winwinwin <- winwinwin %>% 
+  rename(team = Team)
+
+
+team_abbrs_df <- data.frame(
+  team = names(team_abbrs),   # The team names (the names of the vector)
+  team_abbr = team_abbrs      # The abbreviations (the values of the vector)
+)
+
+winwinwin <- full_join(winwinwin, team_abbrs_df, by = "team")
+
+
+colnames(contract_and_stats_summary)
+contract_and_stats_summary_2 <- contract_and_stats_plots %>%
+  group_by(draft_team) %>%
+  summarize(
+    yes_count = sum(resigned_with_draft_team == "yes", na.rm = TRUE),
+    no_count = sum(resigned_with_draft_team == "no", na.rm = TRUE)
+  )
+
+# Calculate the resign_pct for each team
+resign_pct_df <- contract_and_stats_summary_2 %>%
+  mutate(resign_pct = yes_count / (yes_count + no_count)) %>%
+  select(draft_team, resign_pct) 
+
+resign_pct_df <- resign_pct_df %>% 
+  rename(team_abbr = draft_team)
+
+no <- left_join(winwinwin, resign_pct_df, by = "team_abbr")
+
+
+
+ggplot(no, aes(x = Win_pct, y = resign_pct)) +
+  geom_point(color = "white", position = "dodge", size = 4) +  
+  nflplotR::geom_nfl_logos(aes(team_abbr = team_abbr), width = 0.1, alpha = 1) +  
+  labs(title = "Re-signed with Draft Team by Team",
+       subtitle = "Teams with Lowest Win % in Last 10 Years",
+       x = "Win Percentage",
+       y = "Resigned Percentage") +
+  scale_x_continuous(breaks = seq(0.3, 1, by = 0.1), labels = scales::percent_format(accuracy = 1)) + 
+  theme_bw() +
+  theme(legend.position = "none")  
+
+no$Win_pct <- no$Win_pct / 100
+
+
+ggplot(no, aes(x = Win_pct, y = resign_pct)) +
+  geom_point(color = "white", position = "dodge", size = 4) +
+  nflplotR::geom_nfl_logos(aes(team_abbr = team_abbr), width = 0.1, alpha = 1) + 
+  labs(title = "Correlation Between Win % and Resign %",
+       subtitle = "Data Since 2010 Years",
+       x = "Win Percentage",
+       y = "Resigned Percentage") +
+  scale_y_continuous(breaks = seq(0.3, 1, by = 0.1), labels = scales::percent,
+                     expand = expansion(mult = c(0.05, 0.05))) +
+  scale_x_continuous(breaks = seq(0.3, 1, by = 0.1), labels = scales::percent,
+                     expand = expansion(mult = c(0.05, 0.05))) +  
+  theme_bw() +
+  theme(legend.position = "none")
+
+
+valid_team_names(exclude_duplicates = TRUE)
+```
